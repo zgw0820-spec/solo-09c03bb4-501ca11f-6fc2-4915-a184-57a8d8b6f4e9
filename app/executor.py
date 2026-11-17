@@ -9,7 +9,12 @@ The crucial timeout protocol is::
     3. await the shielded task (the cancellation error) so no coroutine is
        left running against this connection;
     4. prove the backend is IDLE (ROLLBACK + transaction_status check);
-    5. only then return the connection to the pool, otherwise discard it
+    5. restore the connect-time session state (``search_path`` and any other
+       session override made by ``SELECT set_config(..., false)``, plus
+       advisory locks) before the connection is reused — a session setting
+       committed by one analyst must not make the next analyst's table
+       reference fail;
+    6. only then return the connection to the pool, otherwise discard it
        and build a replacement.
 
 Transactions are committed *inside* the cursor block on purpose: psycopg's
@@ -107,7 +112,8 @@ class QueryExecutor:
                     raise
                 continue
             except psycopg.Error:
-                # Statement-level error: roll back, verify IDLE, then reuse.
+                # Statement-level error: roll back, verify IDLE, then reuse
+                # (release_healthy also resets any session-level drift).
                 await self._rollback_or_discard(conn)
                 raise
 
@@ -168,10 +174,13 @@ class QueryExecutor:
             logger.info("statement ended after cancel: %s", exc.sqlstate)
 
         # 3) Prove transaction end.  If we cannot, drop the backend.
+        #    release_healthy additionally resets session-level drift (e.g. a
+        #    committed set_config('search_path', ...)) and reports whether
+        #    the connection could actually be reused.
         idle = await self._pool.confirm_idle_or_discard(conn)
         discarded = False
         if idle:
-            await self._pool.release_healthy(conn)
+            discarded = not await self._pool.release_healthy(conn)
         else:
             discarded = True
             await self._pool.discard_and_replace(conn)
@@ -179,7 +188,8 @@ class QueryExecutor:
         elapsed_ms = round((time.monotonic() - acquired_at) * 1000, 3)
         return QueryTimeout(
             "语句执行超过总截止时间，已请求取消"
-            + ("；无法确认后端空闲，连接已弃置并补建" if discarded else ""),
+            + ("；连接状态无法确认或残留会话设置，已弃置并补建"
+               if discarded else ""),
             extra={
                 "status": "timeout",
                 "executed": True,

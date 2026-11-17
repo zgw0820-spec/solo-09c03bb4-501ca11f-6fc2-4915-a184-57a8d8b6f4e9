@@ -13,6 +13,8 @@ Scenarios:
   5. after two concurrent slow queries, later requests still get their own
      results (connection reuse after confirmed rollback)
   6. pool capacity really is two (observed via pg_stat_activity)
+  7. session settings (search_path, advisory locks) set by one analyst's
+     SELECT never leak into the next analyst's request
 """
 from __future__ import annotations
 
@@ -331,6 +333,79 @@ def case_discard_and_rebuild() -> None:
           observed and max(observed) <= 2, f"max={max(observed)}")
 
 
+def case_session_state_isolation() -> None:
+    """set_config(..., false) must not poison the next borrower's session.
+
+    Both pooled connections are polluted on purpose (the exact report: two
+    successful ``SELECT set_config('search_path','pg_catalog',false)``
+    calls), then ordinary queries must still resolve ``fault_logs`` and the
+    pool must report its normal two idle connections.
+    """
+    _, before = get("/health")
+    discarded_before = before["pool"]["total_discarded"]
+
+    for i in range(2):
+        status, body = post(
+            "/query",
+            {
+                "sql": "SELECT set_config('search_path', 'pg_catalog', false)",
+                "timeout_ms": 5000,
+            },
+        )
+        check(f"第 {i + 1} 条连接接受会话级设置",
+              status == 200 and body["rows"] == [["pg_catalog"]], body)
+
+    # Connection A and B are both polluted now.  A further query on either
+    # must be served normally: the pool restores search_path before reuse.
+    for i in range(2):
+        status, body = post(
+            "/query",
+            {"sql": "SELECT count(*) FROM fault_logs", "timeout_ms": 5000},
+        )
+        check(f"污染后第 {i + 1} 次查询仍返回自身结果",
+              status == 200 and body["rows"] == [[7]], body)
+
+    # The reset must be a session reset, not a mask of the problem: the
+    # default search_path is visible to the next borrower again.
+    status, body = post(
+        "/query",
+        {"sql": "SELECT current_setting('search_path')", "timeout_ms": 5000},
+    )
+    check("search_path 已恢复默认",
+          status == 200 and body["rows"] == [['"$user", public']], body)
+
+    # Session-level overrides of other GUCs are reset too: a leaked
+    # statement_timeout would otherwise abort the next analyst's query.
+    # Two rounds touch both pooled connections (the queue alternates).
+    for _ in range(2):
+        post("/query",
+             {"sql": "SELECT set_config('statement_timeout', '1', false)",
+              "timeout_ms": 5000})
+        post("/query",
+             {"sql": "SELECT set_config('default_transaction_read_only',"
+                     " 'off', false)", "timeout_ms": 5000})
+    for i in range(2):
+        status, body = post(
+            "/query",
+            {"sql": "SELECT pg_sleep(0.2)",
+             "timeout_ms": 5000},
+        )
+        check(f"第 {i + 1} 次查询未被残留 statement_timeout 打断",
+              status == 200 and body["status"] == "ok", body)
+    status, body = post(
+        "/query",
+        {"sql": "SELECT current_setting('default_transaction_read_only')",
+         "timeout_ms": 5000},
+    )
+    check("只读默认值已恢复为 on",
+          status == 200 and body["rows"] == [["on"]], body)
+
+    status, health = get("/health")
+    check("会话清理没有牺牲连接（仍复用健康连接）",
+          health["pool"]["total_discarded"] == discarded_before, health)
+    check("隔离测试后两条连接空闲", health["pool"]["idle"] == 2, health)
+
+
 def main() -> int:
     print(f"self-test against {BASE}")
     run_case("1. 健康检查与普通查询", case_health_and_basic)
@@ -339,6 +414,7 @@ def main() -> int:
     run_case("4. 排队期间过期不执行", case_queued_expiry)
     run_case("5. 容量为 2 与接续查询", case_capacity_and_reuse)
     run_case("6. 弃置并补建 / 物理容量", case_discard_and_rebuild)
+    run_case("7. 会话设置跨请求隔离", case_session_state_isolation)
     print(f"\n结果: {PASS} 通过, {FAIL} 失败")
     return 1 if FAIL else 0
 

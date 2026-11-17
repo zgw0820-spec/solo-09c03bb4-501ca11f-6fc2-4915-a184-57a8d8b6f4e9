@@ -6,7 +6,10 @@ concentrate on the hardest correctness guarantees:
 * a statement that finishes just before the cancel request arrives must not
   overwrite the already-decided timeout receipt ("late result");
 * a queued request whose deadline expires never sends a statement;
-* after a timeout the backend is confirmed IDLE before reuse.
+* after a timeout the backend is confirmed IDLE before reuse;
+* a committed session-level setting (``search_path``) or an advisory lock
+  left by one request is removed before the connection is handed out
+  again, and a failed reset discards the connection instead of reusing it.
 
 Run:  python tests/test_protocol.py
 """
@@ -129,6 +132,142 @@ async def main() -> int:
     check("过期语句无任何副作用，后续查询正常", after["rows"] == [[1]], after)
     st = await pool.status()
     check("结束后池满且空闲", st.idle == 2 and st.size == 2, st)
+
+    print("=== D. 会话设置污染后自动复位 ===")
+    for i in range(2):
+        r = await executor.execute(
+            "SELECT set_config('search_path','pg_catalog',false)",
+            time.monotonic() + 5,
+        )
+        check(f"第 {i + 1} 条连接接受会话级 search_path",
+              r["rows"] == [["pg_catalog"]], r)
+    st = await pool.status()
+    discarded_before = st.total_discarded
+    # Both backends are polluted; each of these must still resolve the table
+    # via the restored default search_path and receive its own rows.
+    for i in range(2):
+        r = await executor.execute(
+            "SELECT count(*) FROM fault_logs", time.monotonic() + 5
+        )
+        check(f"污染后第 {i + 1} 次查询仍返回自身结果", r["rows"] == [[7]], r)
+    r = await executor.execute(
+        "SELECT current_setting('search_path')", time.monotonic() + 5
+    )
+    check("search_path 恢复为默认值",
+          r["rows"] == [['"$user", public']], r)
+    # A committed statement_timeout override must not fire on the next
+    # borrower's statement.  The request itself sets a *local* (transaction
+    # scoped) backstop, which is expected to be visible inside the query;
+    # only a leaked session-level value of 1ms would abort the sleep.
+    await executor.execute(
+        "SELECT set_config('statement_timeout','1',false)", time.monotonic() + 5
+    )
+    for i in range(2):
+        r = await executor.execute(
+            "SELECT pg_sleep(0.2)", time.monotonic() + 5
+        )
+        check(f"第 {i + 1} 次查询未被残留 statement_timeout 打断",
+              r["status"] == "ok", r)
+
+    # Advisory locks survive transaction end too.  Verify on one specific
+    # backend: after sanitize the key is no longer held by this session.
+    async def rows_on(conn, sql):
+        async with conn.cursor() as cur:
+            await cur.execute(sql)
+            return await cur.fetchall() if cur.description else []
+
+    lock_count_sql = (
+        "SELECT count(*) FROM pg_locks WHERE locktype='advisory' "
+        "AND pid=pg_backend_pid()"
+    )
+
+    async def advisory_count(conn):
+        await rows_on(conn, "BEGIN READ ONLY")
+        count = await rows_on(conn, lock_count_sql)
+        await rows_on(conn, "COMMIT")
+        return count
+
+    conn = await pool.acquire(time.monotonic() + 5)
+    try:
+        await rows_on(conn, "BEGIN READ ONLY")
+        await rows_on(conn, "SELECT pg_advisory_lock(987654321)")
+        await rows_on(conn, "COMMIT")
+        held = await advisory_count(conn)
+        check("会话级 advisory lock 确实在事务结束后残留",
+              held == [(1,)], held)
+        check("sanitize 成功清除残留状态", await pool.sanitize(conn) is True)
+        left = await advisory_count(conn)
+        check("复位后同一后端不再持有 advisory lock",
+              left == [(0,)], left)
+    finally:
+        if not conn.closed:
+            await pool.release_healthy(conn)
+    for i in range(2):
+        r = await executor.execute(
+            "SELECT pg_try_advisory_lock(987654321)", time.monotonic() + 5
+        )
+        check(f"第 {i + 1} 次查询可重新获取同一 advisory lock",
+              r["rows"] == [[True]], r)
+        await executor.execute(
+            "SELECT pg_advisory_unlock_all()", time.monotonic() + 5
+        )
+
+    st = await pool.status()
+    check("复位通过会话清理完成，未弃置健康连接",
+          st.total_discarded == discarded_before, st)
+    check("复位后容量仍为 2 且全空闲", st.size == 2 and st.idle == 2, st)
+
+    print("=== E. 无法确认复位时弃置补建 ===")
+    original_reset = QueryConnectionPool._reset_session
+
+    async def broken_reset(conn):
+        raise RuntimeError("simulated reset failure")
+
+    QueryConnectionPool._reset_session = staticmethod(broken_reset)
+    try:
+        # Release detects drift, the reset fails -> connection discarded.
+        await executor.execute(
+            "SELECT set_config('search_path','pg_catalog',false)",
+            time.monotonic() + 5,
+        )
+    finally:
+        QueryConnectionPool._reset_session = staticmethod(original_reset)
+    st = await pool.status()
+    check("复位失败时弃置连接", st.total_discarded >= 1, st)
+    check("弃置后补建保持容量 2 且全空闲", st.size == 2 and st.idle == 2, st)
+    for i in range(4):
+        r = await executor.execute(
+            "SELECT count(*) FROM fault_logs", time.monotonic() + 5
+        )
+        check(f"弃置补建后第 {i + 1} 次查询正常", r["rows"] == [[7]], r)
+
+    print("=== F. 取得/校验连接期间预算耗尽 ===")
+    # Verification now happens inside acquire(); a deadline that expires
+    # there must still raise PoolAcquireTimeout with no statement sent and
+    # without leaking a borrower slot.
+    original_sanitize = QueryConnectionPool.sanitize
+
+    async def slow_sanitize(self, conn):
+        await asyncio.sleep(0.3)
+        return await original_sanitize(self, conn)
+
+    QueryConnectionPool.sanitize = slow_sanitize
+    try:
+        err = None
+        try:
+            await executor.execute(
+                "SELECT 'SHOULD-NOT-RUN'", time.monotonic() + 0.1
+            )
+        except PoolAcquireTimeout as exc:
+            err = exc
+    finally:
+        QueryConnectionPool.sanitize = original_sanitize
+    check("校验期间预算耗尽抛 PoolAcquireTimeout", err is not None, err)
+    st = await pool.status()
+    check("未泄漏借出槽位，容量恢复为 2",
+          st.size == 2 and st.idle == 2, st)
+    r = await executor.execute("SELECT 99", time.monotonic() + 5)
+    check("此后普通查询仍返回自身结果", r["rows"] == [[99]], r)
 
     await pool.close()
     pg.cleanup()

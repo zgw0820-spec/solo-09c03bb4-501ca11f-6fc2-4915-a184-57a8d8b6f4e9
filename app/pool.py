@@ -14,6 +14,14 @@ Design goals, mapped to the operational requirements:
   the connection is returned to the pool.  If that cannot be confirmed the
   connection is closed and discarded, and a replacement is built so the
   pool keeps its capacity of two.
+* Session state must not leak between analysts.  ``SELECT`` can still call
+  ``set_config('search_path', ...)`` (or ``pg_advisory_lock``), and a
+  committed session-level setting survives an idle transaction.  Therefore
+  every connection is released only after its session overrides are
+  compared with the snapshot taken at connect time; drift is reset with
+  ``DISCARD ALL`` and the original pool defaults re-applied.  If the reset
+  cannot be verified the connection is discarded and replaced instead of
+  being handed to the next borrower.
 * Every connection is opened in a read-only, read-committed session.
 """
 from __future__ import annotations
@@ -31,6 +39,33 @@ from .config import Settings
 from .errors import PoolAcquireTimeout
 
 logger = logging.getLogger("querypool")
+
+# All *session-level* overrides currently in effect.  ``source = 'session'``
+# is empty for a freshly connected role (role/database defaults are reported
+# as 'role'/'database'), so a connection whose values differ from the
+# snapshot taken at connect time carries state left by a previous borrower.
+# Value comparisons intentionally ignore the display unit: baseline and
+# comparison are read the same way.
+_SESSION_STATE_SQL = """
+SELECT
+    current_user::text AS current_user,
+    (SELECT count(*)
+       FROM pg_catalog.pg_locks
+      WHERE locktype = 'advisory'
+        AND pid = pg_catalog.pg_backend_pid()) AS advisory_locks,
+    (SELECT pg_catalog.jsonb_object_agg(name, setting)
+       FROM pg_catalog.pg_settings
+      WHERE source = 'session') AS session_settings
+"""
+
+# Session defaults re-applied after ``DISCARD ALL``.  Prepared statements
+# are disabled on pooled connections (``prepare_threshold=None``) because
+# ``DISCARD ALL`` deallocates them, which would otherwise turn the next
+# execution into ``InvalidSqlStatementName``.
+_SESSION_DEFAULTS = (
+    "SET default_transaction_read_only = on",
+    "SET default_transaction_isolation = 'read committed'",
+)
 
 
 @dataclass
@@ -109,12 +144,14 @@ class QueryConnectionPool:
             self._settings.database_dsn,
             connect_timeout=self._settings.connect_timeout,
             autocommit=True,
+            prepare_threshold=None,
         )
         # Session-level safety net: even an accidental COMMIT cannot write.
         await conn.execute("SET default_transaction_read_only = on")
         await conn.execute(
             "SET default_transaction_isolation = 'read committed'"
         )
+        conn._pool_session_baseline = await self._read_session_state(conn)
         # Async connections expose a setter coroutine, not a writable property.
         await conn.set_autocommit(False)
         assert conn.info.transaction_status == TransactionStatus.IDLE
@@ -160,12 +197,22 @@ class QueryConnectionPool:
             ) from exc
 
         try:
-            return await self._take_idle_or_build(deadline)
+            conn = await self._take_idle_or_build(deadline)
         except Exception:
             # Any failure to obtain a physical backend frees the borrower
             # slot so the pool cannot deadlock after a failed rebuild.
             self._slots.release()
             raise
+        if time.monotonic() >= deadline:
+            # The budget expired while the connection was being taken or
+            # its session verified.  Hand the (clean) connection back and
+            # report an acquire timeout: nothing was sent to the database.
+            await self._free.put(conn)
+            self._slots.release()
+            raise PoolAcquireTimeout(
+                "总截止时间在取得连接前耗尽，排队期间已过期，语句未执行"
+            )
+        return conn
 
     async def _take_idle_or_build(self, deadline: float) -> AsyncConnection:
         # No lock across awaits: all mutations happen on one event loop and
@@ -179,25 +226,156 @@ class QueryConnectionPool:
             logger.info("no idle backend; lazily rebuilding within pool")
             conn = await self._make_connection()
 
-        if not self._is_idle(conn):
-            # An idle backend turned stale; replace it before handing out.
-            logger.warning(
-                "idle connection not healthy (closed=%s tx=%s), replacing",
-                conn.closed,
-                conn.info.transaction_status,
-            )
+        # Defence in depth: a connection handed out must still be IDLE and
+        # carry exactly its connect-time session state.  Release paths
+        # already validate this; a failure here (e.g. a session killed
+        # while idle) means replace it before it reaches a borrower.
+        if not self._is_idle(conn) or not await self.sanitize(conn):
+            logger.warning("idle connection is unhealthy or polluted; replacing")
             await self._discard_locked(conn)
             conn = await self._make_connection()
         return conn
 
-    async def release_healthy(self, conn: AsyncConnection) -> None:
-        """Return a connection that has been confirmed IDLE to the pool."""
-        if not self._is_idle(conn):
-            # Never put an unverified connection back; rebuild instead.
+    @staticmethod
+    async def _read_session_state(conn: AsyncConnection) -> tuple[str, int, dict]:
+        """Capture current role, advisory-lock count and session overrides."""
+        async with conn.cursor() as cur:
+            await cur.execute(_SESSION_STATE_SQL)
+            row = await cur.fetchone()
+            if not conn.autocommit:
+                # End the read-only transaction opened by the cursor context
+                # so the connection is IDLE, like every other release path.
+                await cur.execute("COMMIT")
+        current_user, advisory_locks, settings = row
+        return current_user, int(advisory_locks), settings or {}
+
+    @classmethod
+    def _state_is_clean(cls, baseline: tuple, current: tuple) -> bool:
+        return baseline == current
+
+    @staticmethod
+    def _describe_state_drift(baseline: tuple, current: tuple) -> dict:
+        """Names and before/after values of every GUC that drifted."""
+        base_settings = baseline[2]
+        settings = current[2]
+        return {
+            name: (base_settings.get(name), settings.get(name))
+            for name in sorted(set(base_settings) | set(settings))
+            if base_settings.get(name) != settings.get(name)
+        }
+
+    @staticmethod
+    async def _ensure_idle(conn: AsyncConnection) -> bool:
+        """ROLLBACK any open/failed transaction and confirm IDLE."""
+        try:
+            if conn.closed:
+                return False
+            if conn.info.transaction_status != TransactionStatus.IDLE:
+                # Also recovers an INERROR transaction left by a cancelled
+                # statement, after which autocommit cannot be toggled yet.
+                await conn.execute("ROLLBACK")
+            return (not conn.closed) and (
+                conn.info.transaction_status == TransactionStatus.IDLE
+            )
+        except Exception:
+            logger.exception("could not return connection to IDLE")
+            return False
+
+    @classmethod
+    async def _reset_session(cls, conn: AsyncConnection) -> None:
+        """Drop every session override and re-apply the pool defaults.
+
+        ``DISCARD ALL`` must run outside a transaction block, so the
+        connection is first returned to IDLE (a leaked tiny
+        ``statement_timeout`` can leave the state probe's transaction
+        aborted) and autocommit is enabled for the reset.  ``DISCARD ALL``
+        also releases session advisory locks and resets
+        ``search_path``/``role``/``statement_timeout`` etc.
+        """
+        if not await cls._ensure_idle(conn):
+            raise RuntimeError("connection not IDLE before session reset")
+        previous_autocommit = conn.autocommit
+        await conn.set_autocommit(True)
+        try:
+            await conn.execute("DISCARD ALL")
+            for statement in _SESSION_DEFAULTS:
+                await conn.execute(statement)
+        finally:
+            # If anything above failed the connection may be INERROR; try
+            # to recover it before restoring autocommit, otherwise leave it
+            # for the caller to discard.
+            with contextlib.suppress(Exception):
+                await conn.execute("ROLLBACK")
+            if conn.info.transaction_status == TransactionStatus.IDLE:
+                await conn.set_autocommit(previous_autocommit)
+        baseline = await cls._read_session_state(conn)
+        conn._pool_session_baseline = baseline
+
+    async def sanitize(self, conn: AsyncConnection) -> bool:
+        """Restore the connect-time session state before reusing ``conn``.
+
+        Returns ``True`` when the session provably matches its baseline and
+        the backend is IDLE.  ``False`` means the connection must not be
+        reused; the caller discards and replaces it.
+
+        A request may legally run ``SELECT set_config('search_path',
+        'pg_catalog', false)``; a ``false`` (session-level) change survives
+        the request transaction and would make the next analyst's
+        ``fault_logs`` query fail with ``UndefinedTable``.  This method
+        detects any such drift plus leftover advisory locks, resets the
+        session and re-verifies it.
+        """
+        baseline = getattr(conn, "_pool_session_baseline", None)
+        if baseline is None:
+            logger.warning("connection has no session baseline; cannot reuse")
+            return False
+        if conn.closed:
+            return False
+        try:
+            if conn.info.transaction_status != TransactionStatus.IDLE:
+                return False
+            current = await self._read_session_state(conn)
+            if self._state_is_clean(baseline, current):
+                return True
+            logger.warning(
+                "session state drift detected (user=%s changed=%s "
+                "advisory_locks=%s); resetting before reuse",
+                current[0],
+                self._describe_state_drift(baseline, current),
+                current[1] - baseline[1],
+            )
+        except Exception:
+            # The probe itself can be aborted by the very state we are
+            # trying to detect (e.g. a leaked statement_timeout=1ms).
+            # Treat it as drift and attempt a full reset.
+            logger.warning("session state probe failed; attempting reset",
+                           exc_info=True)
+            if not await self._ensure_idle(conn):
+                return False
+        try:
+            await self._reset_session(conn)
+            if not await self._ensure_idle(conn):
+                return False
+            return self._state_is_clean(
+                baseline, await self._read_session_state(conn)
+            )
+        except Exception:
+            logger.exception("could not sanitize session state")
+            return False
+
+    async def release_healthy(self, conn: AsyncConnection) -> bool:
+        """Return a connection that is IDLE *and* sanitized to the pool.
+
+        Returns ``True`` when the connection was reused, ``False`` when it
+        had to be discarded and replaced.
+        """
+        if not self._is_idle(conn) or not await self.sanitize(conn):
+            # Never put an unverified or polluted connection back; rebuild.
             await self.discard_and_replace(conn)
-            return
+            return False
         await self._free.put(conn)
         self._slots.release()
+        return True
 
     async def discard_and_replace(self, conn: AsyncConnection) -> None:
         """Drop an unverifiable connection and build its replacement.
